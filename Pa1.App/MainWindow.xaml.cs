@@ -70,7 +70,7 @@ namespace Pa1.App
                 if (src != null) src.AddHook(MaxSizeHook);
                 int pref = 1;   /* DWMWCP_DONOTROUND */
                 int hr = DwmSetWindowAttribute(hwnd, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/, ref pref, 4);
-                ApplyMinSize();   /* 按当前显示器分档同步最小尺寸（DIP 下限 → WPF 层） */
+                QueueDisplayUpdate();
                 try
                 {
                     File.AppendAllText(Path.Combine(Path.GetTempPath(), "gsharpminor-crash.log"),
@@ -78,6 +78,8 @@ namespace Pa1.App
                 }
                 catch { }
             };
+
+            DpiChanged += (ss, ee) => QueueDisplayUpdate();
 
             /* 排序下拉用字符串 Items（与 DevCombo 设备列表同路） */
             SortCombo.ItemsSource = new[]
@@ -102,7 +104,7 @@ namespace Pa1.App
                 Width = Settings.GetDouble("win.w", Width);
                 Height = Settings.GetDouble("win.h", Height);
             }
-            /* 最小尺寸分档（随当前工作区分辨率）：记忆尺寸低于下限时抬到下限 */
+            /* 启动时也使用相同的内容下限。 */
             double minW, minH;
             ComputeMinSize(wa.Width, wa.Height, out minW, out minH);
             if (Height > wa.Height) Height = wa.Height - 16;
@@ -714,7 +716,7 @@ namespace Pa1.App
         /* ════════ 自绘标题栏：窗口控制 + 拖动/双击最大化 ════════ */
 
         /* WM_GETMINMAXINFO：透明无边框窗口默认最大化到整个屏幕（盖住任务栏），
-           手工把最大化矩形钳到显示器工作区；并按当前显示器工作区分档写入
+           手工把最大化矩形钳到显示器工作区；并按当前显示器工作区写入
            ptMinTrackSize ——handled=true 会跳过 WPF 对 MinWidth/MinHeight 的
            默认处理，此前下限形同虚设（窗口可拖到 585px 宽，页签/排序列/页脚被裁）。 */
         IntPtr MaxSizeHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -724,8 +726,7 @@ namespace Pa1.App
             const int WM_DPICHANGED = 0x02E0;
             if (msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED)
             {
-                /* 分辨率/缩放变了（或拖到另一台显示器）→ 重新按档位收放 DIP 下限（延迟到消息外，防重入） */
-                Dispatcher.BeginInvoke(new Action(ApplyMinSize));
+                QueueDisplayUpdate(); // DPI 消息交给 WPF，待其处理建议矩形后再校正。
             }
             else if (msg == WM_GETMINMAXINFO)
             {
@@ -741,7 +742,7 @@ namespace Pa1.App
                         mmi.ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
                         mmi.ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
                         mmi.ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
-                        /* 最小拖放尺寸 = 分档下限（DIP）× 当前窗口 DPI（ptMinTrackSize 是物理像素） */
+                        /* 最小拖放尺寸 = 内容下限（DIP）× 当前窗口 DPI（ptMinTrackSize 是物理像素） */
                         double dpi = DpiOf(hwnd);
                         double minW, minH;
                         ComputeMinSize((mi.rcWork.right - mi.rcWork.left) / dpi,
@@ -756,15 +757,11 @@ namespace Pa1.App
             return IntPtr.Zero;
         }
 
-        /// <summary>最小窗口尺寸按当前工作区分档（DIP）：内容底线 900×620（小于它页签行/
-        /// 排序列/页脚被裁出界，2026-11-16 实测），随分辨率放大（系数 0.46/0.60），
-        /// 4K@100% 封顶 1320×900；小屏兜底永不超过工作区-16（任何分辨率都放得下）。</summary>
+        // DIP 已包含系统缩放。更大的像素工作区不应抬高用户可拖动的下限。
         internal static void ComputeMinSize(double workW, double workH, out double w, out double h)
         {
-            w = Math.Max(900, Math.Min(1320, workW * 0.46));
-            h = Math.Max(620, Math.Min(900, workH * 0.60));
-            w = Math.Min(w, Math.Max(480, workW - 16));
-            h = Math.Min(h, Math.Max(360, workH - 16));
+            w = Math.Min(900, Math.Max(1, workW - 16));
+            h = Math.Min(620, Math.Max(1, workH - 16));
         }
 
         double DpiOf(IntPtr hwnd)
@@ -778,30 +775,70 @@ namespace Pa1.App
             return 1.0;
         }
 
-        /// <summary>把分档下限同步到 WPF MinWidth/MinHeight（布局层），与 ptMinTrackSize 双保险。</summary>
-        void ApplyMinSize()
+        bool _displayUpdateQueued;
+        bool _fitOnRestore;
+
+        void QueueDisplayUpdate()
         {
-            double workW = SystemParameters.WorkArea.Width, workH = SystemParameters.WorkArea.Height;
-            var h = new System.Windows.Interop.WindowInteropHelper(this).Handle;
-            if (h != IntPtr.Zero)
+            if (_displayUpdateQueued) return;
+            _displayUpdateQueued = true;
+            Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
             {
-                IntPtr mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
-                if (mon != IntPtr.Zero)
-                {
-                    var mi = new MONITORINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(MONITORINFO)) };
-                    if (GetMonitorInfo(mon, ref mi))
-                    {
-                        double dpi = DpiOf(h);
-                        workW = (mi.rcWork.right - mi.rcWork.left) / dpi;
-                        workH = (mi.rcWork.bottom - mi.rcWork.top) / dpi;
-                    }
-                }
-            }
-            double w2, h2;
-            ComputeMinSize(workW, workH, out w2, out h2);
-            MinWidth = w2;
-            MinHeight = h2;
+                _displayUpdateQueued = false;
+                ApplyDisplayBounds();
+            }));
         }
+
+        void ApplyDisplayBounds()
+        {
+            var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            if (hwnd == IntPtr.Zero) return;
+            if (WindowState == WindowState.Minimized)
+            {
+                _fitOnRestore = true;
+                return;
+            }
+
+            var mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            var mi = new MONITORINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(MONITORINFO)) };
+            if (mon == IntPtr.Zero || !GetMonitorInfo(mon, ref mi)) return;
+            var area = mi.rcWork;
+            int width = area.right - area.left, height = area.bottom - area.top;
+            if (width <= 0 || height <= 0) return;
+            double dpi = DpiOf(hwnd);
+            double minW, minH;
+            ComputeMinSize(width / dpi, height / dpi, out minW, out minH);
+            MinWidth = minW;
+            MinHeight = minH;
+
+            RECT current;
+            if (!GetWindowRect(hwnd, out current)) return;
+            var target = area;
+            _fitOnRestore = WindowState == WindowState.Maximized;
+            if (!_fitOnRestore)
+                target = FitNormalBounds(current, area, (int)Math.Round(minW * dpi), (int)Math.Round(minH * dpi));
+
+            if (current.left != target.left || current.top != target.top ||
+                current.right != target.right || current.bottom != target.bottom)
+                SetWindowPos(hwnd, IntPtr.Zero, target.left, target.top,
+                    target.right - target.left, target.bottom - target.top, SWP_NOACTIVATE | SWP_NOZORDER);
+        }
+
+        // 全程使用屏幕物理像素，支持位于主屏左侧或上方的显示器。
+        static RECT FitNormalBounds(RECT current, RECT area, int minWidth, int minHeight)
+        {
+            int width = Math.Min(area.right - area.left, Math.Max(minWidth, current.right - current.left));
+            int height = Math.Min(area.bottom - area.top, Math.Max(minHeight, current.bottom - current.top));
+            int left = Math.Max(area.left, Math.Min(current.left, area.right - width));
+            int top = Math.Max(area.top, Math.Min(current.top, area.bottom - height));
+            return new RECT { left = left, top = top, right = left + width, bottom = top + height };
+        }
+
+        const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int w, int h, uint flags);
 
         [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
         struct POINTAPI { public int x, y; }
@@ -840,6 +877,7 @@ namespace Pa1.App
 
         void Win_StateChanged(object s, EventArgs e)
         {
+            if (_fitOnRestore && WindowState != WindowState.Minimized) QueueDisplayUpdate();
             if (BtnMaximize == null) return;
             bool max = WindowState == WindowState.Maximized;
             BtnMaximize.Content = max ? "❐" : "□";

@@ -8,6 +8,12 @@ namespace Pa1.App
 {
     public partial class App : Application
     {
+        static App()
+        {
+            // 单文件发布也显式启用 WPF 的每显示器 DPI 布局。
+            AppContext.SetSwitch("Switch.System.Windows.DoNotScaleForDpiChanges", false);
+        }
+
         /* 系统定时器精度 15.6ms → 1ms：音频轮询线程的睡眠粒度、DispatcherTimer 量化都靠它 */
         [DllImport("winmm.dll")] internal static extern uint timeBeginPeriod(uint period);
         [DllImport("winmm.dll")] internal static extern uint timeEndPeriod(uint period);
